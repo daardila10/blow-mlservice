@@ -9,6 +9,7 @@ import soundfile as sf
 import httpx
 import re
 import os
+import requests
 
 # ==============================================================
 # 🔧 CONFIGURATION
@@ -51,20 +52,53 @@ async def download_from_gdrive(file_id: str, destination: str):
         return
 
     os.makedirs(os.path.dirname(destination), exist_ok=True)
-    url = f"https://drive.google.com/uc?export=download&id={file_id}"
-
-    print(f"⬇️ Downloading model from {url} ...")
+    
+    print(f"🚀 Starting model setup for {destination}...")
+    
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url)
-            if response.status_code != 200:
-                raise Exception(f"Failed to download model (status {response.status_code})")
-            with open(destination, "wb") as f:
-                f.write(response.content)
-        print(f"✅ Model saved: {destination}")
+        # Use requests instead of httpx for better cookie handling
+        import requests
+        
+        URL = f"https://drive.google.com/uc?export=download&id={file_id}"
+        
+        print(f"⬇️ Downloading model from {URL} ...")
+        
+        session = requests.Session()
+        
+        # Initial request to get the confirmation token
+        response = session.get(URL, stream=True)
+        
+        if response.status_code == 200:
+            # Check if we got a confirmation page (for large files)
+            for key, value in response.cookies.items():
+                if key.startswith('download_warning'):
+                    # We need to confirm the download
+                    URL = f"https://drive.google.com/uc?export=download&confirm={value}&id={file_id}"
+                    response = session.get(URL, stream=True)
+                    break
+            
+            # Now download the file
+            if response.status_code == 200:
+                total_size = int(response.headers.get('content-length', 0))
+                downloaded_size = 0
+                
+                with open(destination, 'wb') as file:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            file.write(chunk)
+                            downloaded_size += len(chunk)
+                            if total_size > 0:
+                                percent = (downloaded_size / total_size) * 100
+                                print(f"📥 Download progress: {percent:.1f}%", end='\r')
+                
+                print(f"\n✅ Model saved: {destination} ({downloaded_size} bytes)")
+                return
+            
+        raise Exception(f"Failed to download model (status {response.status_code})")
+        
     except Exception as e:
+        print(f"❌ Download error: {e}")
         raise RuntimeError(f"Error downloading model from Google Drive: {e}")
-
 # ==============================================================
 # 🧠 MODEL LOADING
 # ==============================================================
