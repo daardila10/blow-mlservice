@@ -16,13 +16,13 @@ import requests
 # ==============================================================
 
 # Google Drive file IDs (replace with yours if needed)
-YAMNET_ID = "1UwuJetN0CksqYHkdAoHgbhNIafCM2kTn"  # example
-BLOW_ID = "1abcYourOtherModelIDHere"  # replace with your second model ID
+# Google Drive file IDs
+YAMNET_ID = "1bQ9NK5TIJsO9bgPJ7uEBUmtIbiZsqD0J"  # yamnet_with_embeddings.tflite
+BLOW_ID = "1Jt1OmsprGF8ciKTKY3YeJMfrxlUbWaRj"    # blow_classifier_compact_ffnine16.tflite
 
 MODEL_DIR = "models"
 YAMNET_PATH = os.path.join(MODEL_DIR, "yamnet_with_embeddings.tflite")
 BLOW_PATH = os.path.join(MODEL_DIR, "blow_classifier_compact_ffnine16.tflite")
-
 # ==============================================================
 # 🚀 FASTAPI APP
 # ==============================================================
