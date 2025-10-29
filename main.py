@@ -123,12 +123,15 @@ async def load_models():
 
 
 
+
 # ==============================================================
 # 🎤 CLASSIFY ENDPOINT
 # ==============================================================
 @app.post("/classify")
 async def classify(file: UploadFile = File(...)):
     try:
+        global yamnet, blow  # ✅ Use globally loaded models
+
         # ✅ Save temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
             tmp.write(await file.read())
@@ -136,26 +139,19 @@ async def classify(file: UploadFile = File(...)):
 
         # ✅ Preprocess the audio (convert to mono, float32)
         data, sr = sf.read(tmp_path, dtype="float32")
-        if len(data.shape) > 1:  # Convert stereo → mono
+        if len(data.shape) > 1:
             data = np.mean(data, axis=1)
 
         # ✅ Normalize audio to [-1, 1]
         data = np.clip(data / np.max(np.abs(data)), -1.0, 1.0)
 
-        # ✅ Load models
-        yamnet = tf.lite.Interpreter(model_path="yamnet.tflite")
-        yamnet.allocate_tensors()
-        blow = tf.lite.Interpreter(model_path="blow_classifier.tflite")
-        blow.allocate_tensors()
-
         # ---------------------------------------------------------------
-        # 🔥 YamNet forward pass (robust to 1D vs [1, N] inputs)
+        # 🔥 YamNet forward pass
         # ---------------------------------------------------------------
         input_details = yamnet.get_input_details()
         output_details = yamnet.get_output_details()
         expected_shape = list(input_details[0]["shape"])
 
-        # Handle dynamic shape (-1)
         if any(d == -1 for d in expected_shape):
             try:
                 yamnet.resize_tensor_input(input_details[0]["index"], [int(len(data))])
@@ -165,7 +161,6 @@ async def classify(file: UploadFile = File(...)):
             except Exception as e:
                 print("⚠️ yamnet.resize failed:", e)
 
-        # ✅ Set tensor correctly depending on model shape
         if len(expected_shape) == 1:
             yamnet.set_tensor(input_details[0]["index"], data.astype(np.float32))
         elif len(expected_shape) == 2:
@@ -175,7 +170,6 @@ async def classify(file: UploadFile = File(...)):
 
         yamnet.invoke()
 
-        # ✅ Get embedding
         yamnet_outputs = yamnet.get_tensor(output_details[0]["index"])
         embedding = yamnet_outputs[0] if yamnet_outputs.ndim > 1 else yamnet_outputs
         embedding = np.asarray(embedding, dtype=np.float32).flatten()
@@ -199,10 +193,8 @@ async def classify(file: UploadFile = File(...)):
         out = blow.get_tensor(blow_output[0]["index"])
         blow_prob = float(np.array(out).flatten()[0])
 
-        # ✅ Cleanup
         os.remove(tmp_path)
 
-        # ✅ Return result
         return {"prediction": "blow" if blow_prob > 0.5 else "no_blow", "probability": blow_prob}
 
     except Exception as e:
