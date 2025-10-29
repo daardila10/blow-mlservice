@@ -157,23 +157,28 @@ async def classify(file: UploadFile = File(...)):
         
         print(f"📐 YamNet expected input shape: {expected_shape}")
 
-        # Handle dynamic shape by resizing the model input
-        if -1 in expected_shape:
+        # Validate YamNet input shape - it should be reasonable for audio
+        if len(expected_shape) == 1 and expected_shape[0] == 1:
+            print("⚠️ Warning: YamNet input shape seems incorrect [1]. This might be a model issue.")
+            # Try to infer correct shape based on standard YamNet
+            # Standard YamNet usually expects [batch_size, audio_samples] where audio_samples > 10000
+            expected_shape = [1, 15600]  # Common YamNet input length
+            print(f"🔄 Using inferred YamNet input shape: {expected_shape}")
+
+        # Handle dynamic shape or incorrect shape
+        if -1 in expected_shape or expected_shape[0] == 1:
             try:
-                # Determine the target shape based on model expectations
-                if len(expected_shape) == 1:
-                    # Model expects 1D: [samples]
-                    target_shape = [len(data)]
-                elif len(expected_shape) == 2:
-                    # Model expects 2D: [batch, samples]
-                    target_shape = [1, len(data)]
+                # Use standard YamNet input length (15600 samples = ~0.975s at 16kHz)
+                target_length = 15600
+                if len(data) > target_length:
+                    # Use middle segment for consistency
+                    start = (len(data) - target_length) // 2
+                    data = data[start:start + target_length]
                 else:
-                    target_shape = expected_shape
-                    # Replace -1 with actual length
-                    for i, dim in enumerate(target_shape):
-                        if dim == -1:
-                            target_shape[i] = len(data)
+                    # Pad if too short
+                    data = np.pad(data, (0, target_length - len(data)), mode='constant')
                 
+                target_shape = [1, target_length]
                 print(f"🔄 Resizing YamNet input to: {target_shape}")
                 yamnet.resize_tensor_input(input_details[0]["index"], target_shape)
                 yamnet.allocate_tensors()
@@ -189,46 +194,34 @@ async def classify(file: UploadFile = File(...)):
         # ✅ Ensure correct shape for YamNet input
         data = data.astype(np.float32)
         
-        # Reshape data to match expected shape exactly
+        # Reshape data to match expected shape
         if list(data.shape) != list(expected_shape):
             print(f"🔄 Reshaping data from {data.shape} to {expected_shape}")
             try:
                 if len(expected_shape) == 1:
-                    # Remove batch dimension if model expects 1D
-                    data = data.flatten()
+                    # If model expects 1D but we have the right length
+                    if data.shape[0] == expected_shape[0]:
+                        data = data.flatten()
+                    else:
+                        # Truncate or pad to expected length
+                        if data.shape[0] > expected_shape[0]:
+                            data = data[:expected_shape[0]]
+                        else:
+                            data = np.pad(data, (0, expected_shape[0] - data.shape[0]), mode='constant')
                 elif len(expected_shape) == 2:
-                    # Add batch dimension if model expects 2D
+                    # Add batch dimension if needed
                     if len(data.shape) == 1:
                         data = np.expand_dims(data, axis=0)
-                
-                # Final check and adjustment for length
-                if len(expected_shape) == 1 and data.shape[0] != expected_shape[0]:
-                    if expected_shape[0] == -1:
-                        # Dynamic 1D, no need to adjust
-                        pass
-                    elif data.shape[0] > expected_shape[0]:
-                        data = data[:expected_shape[0]]
-                    elif data.shape[0] < expected_shape[0]:
-                        data = np.pad(data, (0, expected_shape[0] - data.shape[0]), mode='constant')
-                
-                elif len(expected_shape) == 2 and data.shape[1] != expected_shape[1]:
-                    if expected_shape[1] == -1:
-                        # Dynamic length, no need to adjust
-                        pass
-                    elif data.shape[1] > expected_shape[1]:
+                    # Handle length mismatch
+                    if data.shape[1] > expected_shape[1]:
                         data = data[:, :expected_shape[1]]
                     elif data.shape[1] < expected_shape[1]:
                         padding = expected_shape[1] - data.shape[1]
                         data = np.pad(data, ((0, 0), (0, padding)), mode='constant')
-                        
             except Exception as reshape_error:
                 print(f"❌ Reshaping failed: {reshape_error}")
-                # Fallback: try simple reshape
-                try:
-                    data = data.reshape(expected_shape)
-                except:
-                    os.remove(tmp_path)
-                    raise HTTPException(status_code=500, detail=f"Cannot reshape audio from {data.shape} to {expected_shape}")
+                os.remove(tmp_path)
+                raise HTTPException(status_code=500, detail=f"Cannot reshape audio from {data.shape} to {expected_shape}")
 
         print(f"✅ Final YamNet input shape: {data.shape}")
 
@@ -279,6 +272,7 @@ async def classify(file: UploadFile = File(...)):
         # Clean up temp file in case of error
         if 'tmp_path' in locals() and os.path.exists(tmp_path):
             os.remove(tmp_path)
+        print(f"❌ Classification error: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing audio: {e}")
 # ==============================================================
 # 🏠 ROOT
