@@ -137,12 +137,12 @@ async def classify(file: UploadFile = File(...)):
             tmp.write(await file.read())
             tmp_path = tmp.name
 
-        # ✅ Preprocess the audio (convert to mono, float32)
+        # ✅ Preprocess audio (convert to mono, float32)
         data, sr = sf.read(tmp_path, dtype="float32")
         if len(data.shape) > 1:
             data = np.mean(data, axis=1)
 
-        # ✅ Normalize audio to [-1, 1]
+        # ✅ Normalize to [-1, 1]
         data = np.clip(data / np.max(np.abs(data)), -1.0, 1.0)
 
         # ---------------------------------------------------------------
@@ -152,9 +152,13 @@ async def classify(file: UploadFile = File(...)):
         output_details = yamnet.get_output_details()
         expected_shape = list(input_details[0]["shape"])
 
+        # Handle dynamic shape (-1)
         if any(d == -1 for d in expected_shape):
             try:
-                yamnet.resize_tensor_input(input_details[0]["index"], [int(len(data))])
+                yamnet.resize_tensor_input(
+                    input_details[0]["index"],
+                    [1, int(len(data))],
+                )
                 yamnet.allocate_tensors()
                 input_details = yamnet.get_input_details()
                 expected_shape = list(input_details[0]["shape"])
@@ -164,15 +168,23 @@ async def classify(file: UploadFile = File(...)):
         print("🎧 Audio shape before YamNet:", data.shape)
         print("Expected input shape:", expected_shape)
 
-        # ✅ Ensure input is always [1, N]
+        # ✅ Ensure correct shape for YamNet input
         data = data.astype(np.float32)
-        if len(data.shape) == 1:
-            data = np.expand_dims(data, 0)
+        if len(expected_shape) == 2:
+            # expected [1, N]
+            if len(data.shape) == 1:
+                data = np.expand_dims(data, axis=0)
+        elif len(expected_shape) == 1:
+            # expected [N]
+            data = data.flatten()
 
+        print("✅ Final input shape:", data.shape)
+
+        # ✅ Feed into YamNet
         yamnet.set_tensor(input_details[0]["index"], data)
         yamnet.invoke()
 
-        # ✅ Get embeddings
+        # ✅ Extract embedding
         yamnet_outputs = yamnet.get_tensor(output_details[0]["index"])
         embedding = yamnet_outputs[0] if yamnet_outputs.ndim > 1 else yamnet_outputs
         embedding = np.asarray(embedding, dtype=np.float32).flatten()
@@ -202,7 +214,6 @@ async def classify(file: UploadFile = File(...)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing audio: {e}")
-
 
 # ==============================================================
 # 💌 DEDICATION ENDPOINT
