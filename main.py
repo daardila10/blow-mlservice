@@ -124,63 +124,87 @@ async def load_models():
 # ==============================================================
 # 🎤 CLASSIFY ENDPOINT
 # ==============================================================
-
 @app.post("/classify")
 async def classify(file: UploadFile = File(...)):
     try:
-        print(f"🎯 Received file: {file.filename}")
+        # ✅ Save temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
 
-        contents = await file.read()
+        # ✅ Preprocess the audio (convert to mono, float32)
+        data, sr = sf.read(tmp_path, dtype="float32")
+        if len(data.shape) > 1:  # Convert stereo → mono
+            data = np.mean(data, axis=1)
 
-        try:
-            audio = AudioSegment.from_file(io.BytesIO(contents), format="webm")
-        except Exception:
-            audio = AudioSegment.from_file(io.BytesIO(contents))
+        # ✅ Normalize audio to [-1, 1]
+        data = np.clip(data / np.max(np.abs(data)), -1.0, 1.0)
 
-        # Convert to mono 16kHz WAV
-        audio = audio.set_frame_rate(16000).set_channels(1)
-        wav_io = io.BytesIO()
-        audio.export(wav_io, format="wav")
-        wav_io.seek(0)
+        # ✅ Load models
+        yamnet = tf.lite.Interpreter(model_path="yamnet.tflite")
+        yamnet.allocate_tensors()
+        blow = tf.lite.Interpreter(model_path="blow_classifier.tflite")
+        blow.allocate_tensors()
 
-        data, sr = sf.read(wav_io, dtype="float32")
-        if sr != 16000:
-            raise HTTPException(status_code=400, detail="Audio must be 16kHz")
-
-        yamnet_expected_samples = 15600
-        if len(data) < yamnet_expected_samples:
-            data = np.pad(data, (0, yamnet_expected_samples - len(data)))
-        elif len(data) > yamnet_expected_samples:
-            data = data[:yamnet_expected_samples]
-
-        # ✅ YamNet forward pass
+        # ---------------------------------------------------------------
+        # 🔥 YamNet forward pass (robust to 1D vs [1, N] inputs)
+        # ---------------------------------------------------------------
         input_details = yamnet.get_input_details()
         output_details = yamnet.get_output_details()
+        expected_shape = list(input_details[0]["shape"])
 
-        yamnet.set_tensor(input_details[0]["index"], np.array([data], dtype=np.float32))
+        # Handle dynamic shape (-1)
+        if any(d == -1 for d in expected_shape):
+            try:
+                yamnet.resize_tensor_input(input_details[0]["index"], [int(len(data))])
+                yamnet.allocate_tensors()
+                input_details = yamnet.get_input_details()
+                expected_shape = list(input_details[0]["shape"])
+            except Exception as e:
+                print("⚠️ yamnet.resize failed:", e)
+
+        # ✅ Set tensor correctly depending on model shape
+        if len(expected_shape) == 1:
+            yamnet.set_tensor(input_details[0]["index"], data.astype(np.float32))
+        elif len(expected_shape) == 2:
+            yamnet.set_tensor(input_details[0]["index"], data.astype(np.float32).reshape(1, -1))
+        else:
+            raise HTTPException(status_code=500, detail=f"Unsupported yamnet input shape: {expected_shape}")
+
         yamnet.invoke()
 
-        # Pick correct embedding output (handle multiple outputs safely)
+        # ✅ Get embedding
         yamnet_outputs = yamnet.get_tensor(output_details[0]["index"])
         embedding = yamnet_outputs[0] if yamnet_outputs.ndim > 1 else yamnet_outputs
+        embedding = np.asarray(embedding, dtype=np.float32).flatten()
 
-        # ✅ Blow classifier forward pass
+        # ---------------------------------------------------------------
+        # 🔥 Blow classifier forward pass
+        # ---------------------------------------------------------------
         blow_input = blow.get_input_details()
         blow_output = blow.get_output_details()
+        expected_blow = list(blow_input[0]["shape"])
 
-        blow.set_tensor(blow_input[0]["index"], np.array([embedding], dtype=np.float32))
+        inp = np.zeros(tuple(expected_blow), dtype=np.float32)
+        flat = inp.ravel()
+        src = embedding.flatten()
+        n = min(flat.size, src.size)
+        flat[:n] = src[:n]
+        inp = flat.reshape(expected_blow).astype(np.float32)
+
+        blow.set_tensor(blow_input[0]["index"], inp)
         blow.invoke()
+        out = blow.get_tensor(blow_output[0]["index"])
+        blow_prob = float(np.array(out).flatten()[0])
 
-        blow_prob = float(blow.get_tensor(blow_output[0]["index"])[0][0])
-        print(f"✅ Blow probability: {blow_prob}")
+        # ✅ Cleanup
+        os.remove(tmp_path)
 
-        return {"blowProb": blow_prob}
+        # ✅ Return result
+        return {"prediction": "blow" if blow_prob > 0.5 else "no_blow", "probability": blow_prob}
 
     except Exception as e:
-        import traceback
-        print(f"💥 Error in classification: {e}")
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Error processing audio: {e}")
 
 
 # ==============================================================
