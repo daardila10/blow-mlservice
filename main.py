@@ -130,7 +130,7 @@ async def load_models():
 @app.post("/classify")
 async def classify(file: UploadFile = File(...)):
     try:
-        global yamnet, blow  # ✅ Use globally loaded models
+        global yamnet, blow
 
         # ✅ Save temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
@@ -143,42 +143,94 @@ async def classify(file: UploadFile = File(...)):
             data = np.mean(data, axis=1)
 
         # ✅ Normalize to [-1, 1]
-        data = np.clip(data / np.max(np.abs(data)), -1.0, 1.0)
+        if np.max(np.abs(data)) > 0:
+            data = np.clip(data / np.max(np.abs(data)), -1.0, 1.0)
+
+        print(f"🎧 Original audio shape: {data.shape}, sample rate: {sr}")
 
         # ---------------------------------------------------------------
         # 🔥 YamNet forward pass
         # ---------------------------------------------------------------
         input_details = yamnet.get_input_details()
         output_details = yamnet.get_output_details()
-        expected_shape = list(input_details[0]["shape"])
+        expected_shape = input_details[0]["shape"]
+        
+        print(f"📐 YamNet expected input shape: {expected_shape}")
 
-        # Handle dynamic shape (-1)
-        if any(d == -1 for d in expected_shape):
+        # Handle dynamic shape by resizing the model input
+        if -1 in expected_shape:
             try:
-                yamnet.resize_tensor_input(
-                    input_details[0]["index"],
-                    [1, int(len(data))],
-                )
+                # Determine the target shape based on model expectations
+                if len(expected_shape) == 1:
+                    # Model expects 1D: [samples]
+                    target_shape = [len(data)]
+                elif len(expected_shape) == 2:
+                    # Model expects 2D: [batch, samples]
+                    target_shape = [1, len(data)]
+                else:
+                    target_shape = expected_shape
+                    # Replace -1 with actual length
+                    for i, dim in enumerate(target_shape):
+                        if dim == -1:
+                            target_shape[i] = len(data)
+                
+                print(f"🔄 Resizing YamNet input to: {target_shape}")
+                yamnet.resize_tensor_input(input_details[0]["index"], target_shape)
                 yamnet.allocate_tensors()
+                # Update input details after resizing
                 input_details = yamnet.get_input_details()
-                expected_shape = list(input_details[0]["shape"])
+                expected_shape = input_details[0]["shape"]
+                print(f"✅ New YamNet input shape: {expected_shape}")
             except Exception as e:
-                print("⚠️ yamnet.resize failed:", e)
-
-        print("🎧 Audio shape before YamNet:", data.shape)
-        print("Expected input shape:", expected_shape)
+                print(f"❌ YamNet resize failed: {e}")
+                os.remove(tmp_path)
+                raise HTTPException(status_code=500, detail=f"Model input resize failed: {e}")
 
         # ✅ Ensure correct shape for YamNet input
         data = data.astype(np.float32)
-        if len(expected_shape) == 2:
-            # expected [1, N]
-            if len(data.shape) == 1:
-                data = np.expand_dims(data, axis=0)
-        elif len(expected_shape) == 1:
-            # expected [N]
-            data = data.flatten()
+        
+        # Reshape data to match expected shape exactly
+        if list(data.shape) != list(expected_shape):
+            print(f"🔄 Reshaping data from {data.shape} to {expected_shape}")
+            try:
+                if len(expected_shape) == 1:
+                    # Remove batch dimension if model expects 1D
+                    data = data.flatten()
+                elif len(expected_shape) == 2:
+                    # Add batch dimension if model expects 2D
+                    if len(data.shape) == 1:
+                        data = np.expand_dims(data, axis=0)
+                
+                # Final check and adjustment for length
+                if len(expected_shape) == 1 and data.shape[0] != expected_shape[0]:
+                    if expected_shape[0] == -1:
+                        # Dynamic 1D, no need to adjust
+                        pass
+                    elif data.shape[0] > expected_shape[0]:
+                        data = data[:expected_shape[0]]
+                    elif data.shape[0] < expected_shape[0]:
+                        data = np.pad(data, (0, expected_shape[0] - data.shape[0]), mode='constant')
+                
+                elif len(expected_shape) == 2 and data.shape[1] != expected_shape[1]:
+                    if expected_shape[1] == -1:
+                        # Dynamic length, no need to adjust
+                        pass
+                    elif data.shape[1] > expected_shape[1]:
+                        data = data[:, :expected_shape[1]]
+                    elif data.shape[1] < expected_shape[1]:
+                        padding = expected_shape[1] - data.shape[1]
+                        data = np.pad(data, ((0, 0), (0, padding)), mode='constant')
+                        
+            except Exception as reshape_error:
+                print(f"❌ Reshaping failed: {reshape_error}")
+                # Fallback: try simple reshape
+                try:
+                    data = data.reshape(expected_shape)
+                except:
+                    os.remove(tmp_path)
+                    raise HTTPException(status_code=500, detail=f"Cannot reshape audio from {data.shape} to {expected_shape}")
 
-        print("✅ Final input shape:", data.shape)
+        print(f"✅ Final YamNet input shape: {data.shape}")
 
         # ✅ Feed into YamNet
         yamnet.set_tensor(input_details[0]["index"], data)
@@ -189,71 +241,45 @@ async def classify(file: UploadFile = File(...)):
         embedding = yamnet_outputs[0] if yamnet_outputs.ndim > 1 else yamnet_outputs
         embedding = np.asarray(embedding, dtype=np.float32).flatten()
 
+        print(f"📊 YamNet embedding shape: {embedding.shape}")
+
         # ---------------------------------------------------------------
         # 🔥 Blow classifier forward pass
         # ---------------------------------------------------------------
-        blow_input = blow.get_input_details()
-        blow_output = blow.get_output_details()
-        expected_blow = list(blow_input[0]["shape"])
+        blow_input_details = blow.get_input_details()
+        blow_output_details = blow.get_output_details()
+        expected_blow_shape = blow_input_details[0]["shape"]
 
-        inp = np.zeros(tuple(expected_blow), dtype=np.float32)
+        print(f"📐 Blow classifier expected input shape: {expected_blow_shape}")
+
+        # Prepare input for blow classifier
+        inp = np.zeros(tuple(expected_blow_shape), dtype=np.float32)
         flat = inp.ravel()
         src = embedding.flatten()
         n = min(flat.size, src.size)
         flat[:n] = src[:n]
-        inp = flat.reshape(expected_blow).astype(np.float32)
+        inp = flat.reshape(expected_blow_shape).astype(np.float32)
 
-        blow.set_tensor(blow_input[0]["index"], inp)
+        print(f"✅ Blow classifier input shape: {inp.shape}")
+
+        blow.set_tensor(blow_input_details[0]["index"], inp)
         blow.invoke()
-        out = blow.get_tensor(blow_output[0]["index"])
+        out = blow.get_tensor(blow_output_details[0]["index"])
         blow_prob = float(np.array(out).flatten()[0])
 
         os.remove(tmp_path)
 
-        return {"prediction": "blow" if blow_prob > 0.5 else "no_blow", "probability": blow_prob}
+        return {
+            "prediction": "blow" if blow_prob > 0.5 else "no_blow", 
+            "probability": blow_prob,
+            "embedding_shape": embedding.shape
+        }
 
     except Exception as e:
+        # Clean up temp file in case of error
+        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+            os.remove(tmp_path)
         raise HTTPException(status_code=500, detail=f"Error processing audio: {e}")
-
-# ==============================================================
-# 💌 DEDICATION ENDPOINT
-# ==============================================================
-
-@app.get("/dedication/{doc_id}")
-async def dedications_proxy(doc_id: str):
-    url = f"https://blowithback.onrender.com/view/{doc_id}"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(url)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Upstream request failed: {e}")
-
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Upstream returned {r.status_code}")
-
-    text = r.text
-
-    def first(group):
-        return (group.group(1).strip() if group else None)
-
-    sender = first(re.search(r"From:\s*(.+)", text, re.I))
-    receiver = first(re.search(r"To:\s*(.+)", text, re.I)) or first(re.search(r"Receiver:\s*(.+)", text, re.I))
-    message = None
-    m = re.search(r"Message:\s*([\s\S]*?)(?:\n\n|$)", text, re.I)
-    if m:
-        message = m.group(1).strip()
-    video_name = first(re.search(r"Video:\s*(.+)", text, re.I))
-
-    return {
-        "id": doc_id,
-        "senderName": sender,
-        "receiverName": receiver,
-        "message": message,
-        "videoId": video_name,
-        "raw": text[:500]
-    }
-
-
 # ==============================================================
 # 🏠 ROOT
 # ==============================================================
