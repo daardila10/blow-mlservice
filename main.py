@@ -120,90 +120,68 @@ async def load_models():
     print("✅ All models loaded and ready!")
 
 
+
 # ==============================================================
-# 🎙️ CLASSIFICATION ENDPOINT
+# 🎤 CLASSIFY ENDPOINT
 # ==============================================================
 
 @app.post("/classify")
 async def classify(file: UploadFile = File(...)):
     try:
-        print(f"🎯 Received audio file: {file.filename}, size: {file.size}")
-        
+        print(f"🎯 Received file: {file.filename}")
+
         contents = await file.read()
-        print(f"📦 File size after reading: {len(contents)} bytes")
-        
-        # Convert WebM to WAV
+
         try:
             audio = AudioSegment.from_file(io.BytesIO(contents), format="webm")
-            print(f"🔊 Audio loaded: {len(audio)} ms, {audio.frame_rate} Hz, {audio.channels} channels")
-        except Exception as e:
-            print(f"❌ WebM conversion failed: {e}")
-            # Try other formats
-            try:
-                audio = AudioSegment.from_file(io.BytesIO(contents))
-                print(f"🔊 Audio loaded (auto-detect): {len(audio)} ms, {audio.frame_rate} Hz, {audio.channels} channels")
-            except Exception as e2:
-                raise HTTPException(status_code=400, detail=f"Unsupported audio format: {e2}")
+        except Exception:
+            audio = AudioSegment.from_file(io.BytesIO(contents))
 
-        # Convert to 16kHz mono
+        # Convert to mono 16kHz WAV
         audio = audio.set_frame_rate(16000).set_channels(1)
         wav_io = io.BytesIO()
         audio.export(wav_io, format="wav")
         wav_io.seek(0)
-        
-        # Read WAV data
-        data, sr = sf.read(wav_io)
-        print(f"🎵 Processed audio: {len(data)} samples, {sr} Hz")
-        
+
+        data, sr = sf.read(wav_io, dtype="float32")
         if sr != 16000:
             raise HTTPException(status_code=400, detail="Audio must be 16kHz")
-        
-        if len(data) < 1000:  # Minimum samples check
-            raise HTTPException(status_code=400, detail="Audio too short")
-        
-        # Ensure we have enough samples for YamNet (pad if needed)
+
         yamnet_expected_samples = 15600
         if len(data) < yamnet_expected_samples:
-            # Pad with zeros
-            data = np.pad(data, (0, yamnet_expected_samples - len(data)), mode='constant')
+            data = np.pad(data, (0, yamnet_expected_samples - len(data)))
         elif len(data) > yamnet_expected_samples:
-            # Truncate
             data = data[:yamnet_expected_samples]
-        
-        print(f"📊 Final audio shape: {data.shape}")
 
-        # Yamnet forward pass
+        # ✅ YamNet forward pass
         input_details = yamnet.get_input_details()
         output_details = yamnet.get_output_details()
-        
-        print(f"🔧 YamNet input details: {input_details}")
-        print(f"🔧 YamNet output details: {output_details}")
-        
-        yamnet.set_tensor(input_details[0]['index'], np.array([data], dtype=np.float32))
-        yamnet.invoke()
-        embedding = yamnet.get_tensor(output_details[0]['index'])[0]
-        print(f"📐 Embedding shape: {embedding.shape}")
 
-        # Blow classifier forward pass
+        yamnet.set_tensor(input_details[0]["index"], np.array([data], dtype=np.float32))
+        yamnet.invoke()
+
+        # Pick correct embedding output (handle multiple outputs safely)
+        yamnet_outputs = yamnet.get_tensor(output_details[0]["index"])
+        embedding = yamnet_outputs[0] if yamnet_outputs.ndim > 1 else yamnet_outputs
+
+        # ✅ Blow classifier forward pass
         blow_input = blow.get_input_details()
         blow_output = blow.get_output_details()
-        
-        print(f"🔧 Blow classifier input details: {blow_input}")
-        print(f"🔧 Blow classifier output details: {blow_output}")
-        
-        blow.set_tensor(blow_input[0]['index'], np.array([embedding], dtype=np.float32))
+
+        blow.set_tensor(blow_input[0]["index"], np.array([embedding], dtype=np.float32))
         blow.invoke()
-        blow_prob = float(blow.get_tensor(blow_output[0]['index'])[0][0])
-        
-        print(f"🎉 Classification successful! Blow probability: {blow_prob}")
-        
+
+        blow_prob = float(blow.get_tensor(blow_output[0]["index"])[0][0])
+        print(f"✅ Blow probability: {blow_prob}")
+
         return {"blowProb": blow_prob}
 
     except Exception as e:
-        print(f"💥 Error in classification: {str(e)}")
         import traceback
-        print(f"🔍 Stack trace: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Error processing audio: {str(e)}")
+        print(f"💥 Error in classification: {e}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # ==============================================================
 # 💌 DEDICATION ENDPOINT
