@@ -10,6 +10,8 @@ import httpx
 import re
 import os
 import requests
+import tempfile
+
 
 # ==============================================================
 # 🔧 CONFIGURATION
