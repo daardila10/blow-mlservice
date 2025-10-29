@@ -161,15 +161,18 @@ async def classify(file: UploadFile = File(...)):
             except Exception as e:
                 print("⚠️ yamnet.resize failed:", e)
 
-        if len(expected_shape) == 1:
-            yamnet.set_tensor(input_details[0]["index"], data.astype(np.float32))
-        elif len(expected_shape) == 2:
-            yamnet.set_tensor(input_details[0]["index"], data.astype(np.float32).reshape(1, -1))
-        else:
-            raise HTTPException(status_code=500, detail=f"Unsupported yamnet input shape: {expected_shape}")
+        print("🎧 Audio shape before YamNet:", data.shape)
+        print("Expected input shape:", expected_shape)
 
+        # ✅ Ensure input is always [1, N]
+        data = data.astype(np.float32)
+        if len(data.shape) == 1:
+            data = np.expand_dims(data, 0)
+
+        yamnet.set_tensor(input_details[0]["index"], data)
         yamnet.invoke()
 
+        # ✅ Get embeddings
         yamnet_outputs = yamnet.get_tensor(output_details[0]["index"])
         embedding = yamnet_outputs[0] if yamnet_outputs.ndim > 1 else yamnet_outputs
         embedding = np.asarray(embedding, dtype=np.float32).flatten()
