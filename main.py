@@ -215,10 +215,10 @@ async def classify(file: UploadFile = File(...)):
         print(f"🎧 Original audio shape: {data.shape}, sample rate: {sr}")
 
         # ---------------------------------------------------------------
-        # 🔥 YamNet forward pass - USE 32-DIM EMBEDDINGS
+        # 🔥 YamNet forward pass - USE CORRECT OUTPUT 1
         # ---------------------------------------------------------------
         
-        # Resize YamNet input to exactly 15600 samples
+        # IMPORTANT: YamNet expects exactly 15600 samples at 16kHz
         EXPECTED_SAMPLES = 15600
         
         # Prepare waveform array (pad/truncate as needed)
@@ -229,8 +229,11 @@ async def classify(file: UploadFile = File(...)):
         print(f"📐 YamNet input shape: {waveform.shape}")
         print(f"📊 Input non-zero samples: {np.count_nonzero(waveform)}/{len(waveform)}")
         
-        # Reset and reallocate the interpreter
+        # Reset and reallocate the interpreter with correct input shape
         yamnet = tf.lite.Interpreter(model_path=YAMNET_PATH)
+        
+        # CRITICAL: The model expects shape [1] but we need to provide [15600] samples
+        # Let's resize to the actual expected input size
         yamnet.resize_tensor_input(0, [EXPECTED_SAMPLES])
         yamnet.allocate_tensors()
         
@@ -239,11 +242,11 @@ async def classify(file: UploadFile = File(...)):
         output_details = yamnet.get_output_details()
         
         print(f"✅ Final YamNet input shape: {input_details[0]['shape']}")
-        print(f"📊 YamNet has {len(output_details)} outputs:")
+        print(f"📊 YamNet outputs:")
         for i, out in enumerate(output_details):
-            print(f"  Output {i}: shape={out['shape']}, dtype={out['dtype']}")
+            print(f"  Output {i}: shape={out['shape']}, name={out.get('name', 'unknown')}")
         
-        # Set input tensor
+        # Set input tensor - provide the 15600 samples
         yamnet.set_tensor(input_details[0]["index"], waveform)
         
         # Invoke the model
@@ -251,33 +254,18 @@ async def classify(file: UploadFile = File(...)):
         yamnet.invoke()
         print("✅ YamNet inference completed")
 
-        # ✅ Extract the 32-dimensional embeddings from outputs 1 and 2
-        print("🔍 Extracting 32-dim embeddings from YamNet:")
+        # ✅ Extract the 1024-dimensional embedding from Output 1 (Identity_1)
+        print("🔍 Extracting 1024-dim embedding from Output 1 (Identity_1)...")
         
-        # Get both 32-dim outputs and combine them
-        embedding_output_1 = yamnet.get_tensor(1)  # shape: (32,)
-        embedding_output_2 = yamnet.get_tensor(2)  # shape: (32,)
+        # Output 1: [1, 1024] - This is the embedding we need!
+        embedding_output = yamnet.get_tensor(1)  # shape: [1, 1024]
         
-        print(f"📊 Output 1: shape={embedding_output_1.shape}, sample={embedding_output_1[:5].tolist()}")
-        print(f"📊 Output 2: shape={embedding_output_2.shape}, sample={embedding_output_2[:5].tolist()}")
+        print(f"📊 Output 1 shape: {embedding_output.shape}")
+        print(f"📊 Output 1 sample values: {embedding_output[0][:5].tolist()}")
         
-        # Combine both 32-dim embeddings into a 64-dim embedding
-        combined_embedding = np.concatenate([embedding_output_1, embedding_output_2])
-        print(f"📊 Combined embedding: shape={combined_embedding.shape}")
-        
-        # Expand to 1024 dimensions using interpolation/repetition
-        target_size = 1024
-        if len(combined_embedding) < target_size:
-            # Use interpolation to expand 64 dimensions to 1024
-            x_original = np.linspace(0, 1, len(combined_embedding))
-            x_target = np.linspace(0, 1, target_size)
-            expanded_embedding = np.interp(x_target, x_original, combined_embedding)
-        else:
-            # If somehow larger, truncate
-            expanded_embedding = combined_embedding[:target_size]
-        
-        final_embedding = expanded_embedding.astype(np.float32)
-        embedding_source = "outputs_1_2_combined_expanded"
+        # Extract the 1024-dimensional vector (remove batch dimension)
+        final_embedding = embedding_output[0].astype(np.float32)  # shape: [1024]
+        embedding_source = "output_1_identity_1"
         
         print(f"📊 Final embedding shape: {final_embedding.shape}, source: {embedding_source}")
         print(f"📊 Embedding non-zero: {np.count_nonzero(final_embedding)}/{len(final_embedding)}")
@@ -293,16 +281,12 @@ async def classify(file: UploadFile = File(...)):
 
         print(f"📐 Blow classifier expected input shape: {expected_blow_shape}")
 
-        # Prepare input for blow classifier
-        inp = np.zeros(tuple(expected_blow_shape), dtype=np.float32)
-        flat = inp.ravel()
-        src = final_embedding.flatten()
-        n = min(flat.size, src.size)
-        flat[:n] = src[:n]
-        inp = flat.reshape(expected_blow_shape).astype(np.float32)
-
+        # Prepare input for blow classifier - shape should be [1, 1024]
+        # Our embedding is already [1024], so we need to add batch dimension
+        inp = np.expand_dims(final_embedding, axis=0).astype(np.float32)  # shape: [1, 1024]
+        
         print(f"✅ Blow classifier input shape: {inp.shape}")
-        print(f"📊 Embedding used: {n} elements")
+        print(f"📊 Embedding used: {inp.size} elements")
 
         blow.set_tensor(blow_input_details[0]["index"], inp)
         blow.invoke()
@@ -317,10 +301,9 @@ async def classify(file: UploadFile = File(...)):
             "probability": blow_prob,
             "embedding_shape": final_embedding.shape,
             "embedding_sample": final_embedding[:5].tolist(),
-            "embedding_used_size": n,
+            "embedding_used_size": len(final_embedding),
             "embedding_source": embedding_source,
-            "embedding_non_zero": int(np.count_nonzero(final_embedding)),
-            "original_embedding_size": 64  # 32 + 32
+            "embedding_non_zero": int(np.count_nonzero(final_embedding))
         }
 
     except Exception as e:
