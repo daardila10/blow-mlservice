@@ -247,50 +247,69 @@ async def classify(file: UploadFile = File(...)):
         # Invoke the model
         yamnet.invoke()
 
-        # ✅ Extract embedding - try different strategies to find the 1024-dim embedding
-        embedding = None
-        
-        # Strategy 1: Look for output with shape that includes 1024
+        # ✅ Extract ALL outputs and analyze them
+        print("🔍 Analyzing YamNet outputs:")
+        all_outputs = []
         for i, output_detail in enumerate(output_details):
-            shape = output_detail['shape']
-            if 1024 in shape:
-                output_data = yamnet.get_tensor(i)
-                print(f"🎯 Found potential embedding at output {i} with shape {shape}")
-                # Flatten and take first 1024 elements if needed
-                flat_output = output_data.flatten()
-                if len(flat_output) >= 1024:
-                    embedding = flat_output[:1024].astype(np.float32)
-                    print(f"✅ Using embedding from output {i}, shape: {embedding.shape}")
+            output_data = yamnet.get_tensor(i)
+            flat_output = output_data.flatten()
+            all_outputs.append({
+                'index': i,
+                'shape': output_data.shape,
+                'flat_size': flat_output.shape[0],
+                'data': output_data,
+                'sample_values': flat_output[:5].tolist() if flat_output.shape[0] > 0 else []
+            })
+            print(f"  Output {i}: shape={output_data.shape}, flat_size={flat_output.shape[0]}, sample={all_outputs[-1]['sample_values']}")
+
+        # Strategy: Find the most likely embedding output
+        # Based on your Kotlin code, we want a 1024-dimensional embedding
+        embedding = None
+        embedding_source = "unknown"
+        
+        # Look for output with exactly 1024 elements
+        for output_info in all_outputs:
+            if output_info['flat_size'] == 1024:
+                embedding = output_info['data'].flatten().astype(np.float32)
+                embedding_source = f"output_{output_info['index']}_exact_1024"
+                print(f"✅ Found exact 1024-dim embedding at output {output_info['index']}")
+                break
+        
+        # If no exact match, look for output that contains 1024 in its shape
+        if embedding is None:
+            for output_info in all_outputs:
+                if 1024 in output_info['shape']:
+                    output_data = output_info['data']
+                    # If it's multi-dimensional, take the first frame
+                    if len(output_data.shape) > 1:
+                        embedding = output_data[0].flatten().astype(np.float32)
+                    else:
+                        embedding = output_data.flatten().astype(np.float32)
+                    embedding_source = f"output_{output_info['index']}_shape_contains_1024"
+                    print(f"✅ Found embedding with 1024 in shape at output {output_info['index']}")
                     break
         
-        # Strategy 2: If no 1024-dim output found, try to find the largest output
+        # If still no embedding, use the output with the most non-zero values
         if embedding is None:
-            print("🔍 No 1024-dim output found, looking for largest output...")
-            max_size = 0
-            best_output_idx = -1
-            for i, output_detail in enumerate(output_details):
-                output_data = yamnet.get_tensor(i)
-                flat_size = output_data.flatten().shape[0]
-                print(f"  Output {i}: flat size = {flat_size}")
-                if flat_size > max_size:
-                    max_size = flat_size
-                    best_output_idx = i
+            best_output = None
+            max_non_zero = -1
+            for output_info in all_outputs:
+                output_data = output_info['data']
+                flat_data = output_data.flatten()
+                non_zero_count = np.count_nonzero(flat_data)
+                if non_zero_count > max_non_zero:
+                    max_non_zero = non_zero_count
+                    best_output = output_info
             
-            if best_output_idx >= 0:
-                output_data = yamnet.get_tensor(best_output_idx)
-                embedding = output_data.flatten().astype(np.float32)
-                print(f"✅ Using largest output {best_output_idx} as embedding, shape: {embedding.shape}")
-        
-        # Strategy 3: If still no embedding, use the first output
-        if embedding is None and len(output_details) > 0:
-            output_data = yamnet.get_tensor(0)
-            embedding = output_data.flatten().astype(np.float32)
-            print(f"⚠️ Using first output as embedding, shape: {embedding.shape}")
+            if best_output is not None:
+                embedding = best_output['data'].flatten().astype(np.float32)
+                embedding_source = f"output_{best_output['index']}_most_non_zero"
+                print(f"✅ Using output {best_output['index']} with most non-zero values ({max_non_zero}) as embedding")
         
         if embedding is None:
             raise ValueError("Could not extract embedding from YamNet model")
             
-        print(f"📊 Final embedding shape: {embedding.shape}")
+        print(f"📊 Final embedding shape: {embedding.shape}, source: {embedding_source}")
 
         # ---------------------------------------------------------------
         # 🔥 Blow classifier forward pass
@@ -312,6 +331,7 @@ async def classify(file: UploadFile = File(...)):
         inp = flat.reshape(expected_blow_shape).astype(np.float32)
 
         print(f"✅ Blow classifier input shape: {inp.shape}")
+        print(f"📊 Embedding used: {n} elements out of {src.size} available")
 
         blow.set_tensor(blow_input_details[0]["index"], inp)
         blow.invoke()
@@ -325,8 +345,9 @@ async def classify(file: UploadFile = File(...)):
             "prediction": "blow" if blow_prob > 0.5 else "no_blow", 
             "probability": blow_prob,
             "embedding_shape": embedding.shape,
-            "embedding_sample": embedding[:5].tolist(),  # First 5 values for debugging
-            "embedding_used_size": n
+            "embedding_sample": embedding[:5].tolist(),
+            "embedding_used_size": n,
+            "embedding_source": embedding_source
         }
 
     except Exception as e:
