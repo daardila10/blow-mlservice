@@ -268,7 +268,22 @@ async def classify(file: UploadFile = File(...)):
                 
                 # The model is giving us (32,) output - let's use whatever we get
                 # and transform it to 1024 dimensions for the blow classifier
-                output_data = yamnet.get_tensor(0)  # Get the first output
+                # Try to get the embedding tensor (Identity_1)
+                embedding_output = None
+                for out in output_details:
+                    name = (out.get("name") or "").lower()
+                    if "identity_1" in name or "output_1_identity_1" in name:
+                        embedding_output = out
+                        break
+
+                if embedding_output is not None:
+                    output_data = yamnet.get_tensor(embedding_output["index"])
+                    print(f"✅ Using YamNet embedding tensor: {embedding_output.get('name','unknown')} -> shape {output_data.shape}")
+                else:
+                    # fallback to first output
+                    print("⚠️ Embedding tensor not found, using output[0] fallback")
+                    output_data = yamnet.get_tensor(output_details[0]["index"])
+
                 
                 if len(output_data.shape) == 1:
                     # We have a 1D array, let's see what size it is
@@ -406,6 +421,12 @@ async def debug_yamnet(file: UploadFile = File(...)):
                 yamnet.set_tensor(input_details[0]["index"], input_data)
                 yamnet.invoke()
                 
+
+                # Debug: print all YamNet outputs
+                for i, out_det in enumerate(output_details):
+                    out_data = yamnet.get_tensor(out_det["index"])
+                    print(f"🔎 Output {i}: name={out_det.get('name','unknown')}, shape={out_data.shape}, sample={out_data.flatten()[:5].tolist()}")
+
                 # Get all outputs
                 outputs = []
                 for i, out_det in enumerate(output_details):
