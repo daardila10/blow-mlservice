@@ -219,6 +219,14 @@ async def classify(file: UploadFile = File(...)):
 
         print(f"🎧 Original audio shape: {data.shape}, sample rate: {sr}")
 
+        print("🔍 Audio debug:")
+        print(" - dtype:", data.dtype)
+        print(" - min:", np.min(data))
+        print(" - max:", np.max(data))
+        print(" - mean:", np.mean(data))
+        print(" - first 10 samples:", data[:10])
+
+
         # ---------------------------------------------------------------
         # 🔥 YamNet forward pass - HANDLE ACTUAL OUTPUT SHAPE
         # ---------------------------------------------------------------
@@ -352,7 +360,7 @@ async def classify(file: UploadFile = File(...)):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error processing audio: {e}")
-             
+
 @app.post("/debug-yamnet")
 async def debug_yamnet(file: UploadFile = File(...)):
     """Debug endpoint to test YamNet model directly"""
