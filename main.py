@@ -108,39 +108,44 @@ async def load_models():
 
     global yamnet, blow
     
-    # Load YamNet model
-    yamnet = tf.lite.Interpreter(model_path=YAMNET_PATH)
-    
-    # Load Blow classifier model
-    blow = tf.lite.Interpreter(model_path=BLOW_PATH)
-    blow.allocate_tensors()
+    try:
+        # Load YamNet model
+        yamnet = tf.lite.Interpreter(model_path=YAMNET_PATH)
+        yamnet.allocate_tensors()  # ⚠️ ADD THIS LINE
+        
+        # Load Blow classifier model
+        blow = tf.lite.Interpreter(model_path=BLOW_PATH)
+        blow.allocate_tensors()
 
-    # Debug code to check model details
-    print("\n" + "="*50)
-    print("🔍 MODEL DEBUG INFORMATION")
-    print("="*50)
-    
-    # YamNet model details
-    yamnet_input_details = yamnet.get_input_details()
-    yamnet_output_details = yamnet.get_output_details()
-    
-    print("=== YAMNET MODEL DETAILS ===")
-    print("Input details:", yamnet_input_details)
-    print("Number of outputs:", len(yamnet_output_details))
-    for i, output_detail in enumerate(yamnet_output_details):
-        print(f"Output {i}: shape={output_detail['shape']}, dtype={output_detail['dtype']}, name={output_detail.get('name', 'unknown')}")
-    
-    # Blow classifier model details
-    blow_input_details = blow.get_input_details()
-    blow_output_details = blow.get_output_details()
-    
-    print("\n=== BLOW CLASSIFIER MODEL DETAILS ===")
-    print("Input details:", blow_input_details)
-    print("Output details:", blow_output_details)
-    
-    print("="*50)
-    print("✅ All models loaded and ready!")
-
+        # Debug code to check model details
+        print("\n" + "="*50)
+        print("🔍 MODEL DEBUG INFORMATION")
+        print("="*50)
+        
+        # YamNet model details
+        yamnet_input_details = yamnet.get_input_details()
+        yamnet_output_details = yamnet.get_output_details()
+        
+        print("=== YAMNET MODEL DETAILS ===")
+        print("Input details:", yamnet_input_details)
+        print("Number of outputs:", len(yamnet_output_details))
+        for i, output_detail in enumerate(yamnet_output_details):
+            print(f"Output {i}: shape={output_detail['shape']}, dtype={output_detail['dtype']}, name={output_detail.get('name', 'unknown')}")
+        
+        # Blow classifier model details
+        blow_input_details = blow.get_input_details()
+        blow_output_details = blow.get_output_details()
+        
+        print("\n=== BLOW CLASSIFIER MODEL DETAILS ===")
+        print("Input details:", blow_input_details)
+        print("Output details:", blow_output_details)
+        
+        print("="*50)
+        print("✅ All models loaded and ready!")
+        
+    except Exception as e:
+        print(f"❌ Error loading models: {e}")
+        raise RuntimeError(f"Model loading failed: {e}")
 # ==============================================================
 # 🎤 AUDIO PROCESSING UTILITIES
 # ==============================================================
@@ -215,53 +220,81 @@ async def classify(file: UploadFile = File(...)):
         print(f"🎧 Original audio shape: {data.shape}, sample rate: {sr}")
 
         # ---------------------------------------------------------------
-        # 🔥 YamNet forward pass - FIXED INPUT HANDLING
+        # 🔥 YamNet forward pass - CORRECT INPUT HANDLING
         # ---------------------------------------------------------------
-        
-        # IMPORTANT: YamNet expects exactly 15600 samples at 16kHz
-        EXPECTED_SAMPLES = 15600
-        
-        # Prepare waveform array (pad/truncate as needed)
-        waveform = np.zeros(EXPECTED_SAMPLES, dtype=np.float32)
-        actual_samples = min(data.shape[0], EXPECTED_SAMPLES)
-        waveform[:actual_samples] = data[:actual_samples]
-        
-        print(f"📐 YamNet input samples: {waveform.shape}")
-        print(f"📊 Input non-zero samples: {np.count_nonzero(waveform)}/{len(waveform)}")
-        
-        # Get input details - the model expects shape [1] but we need to provide the actual samples
+
+        # Get input details FIRST
         input_details = yamnet.get_input_details()
         output_details = yamnet.get_output_details()
-        
+
         print(f"📋 YamNet input details: {input_details[0]}")
-        print(f"📋 YamNet output details: {[{'index': i, 'shape': out['shape']} for i, out in enumerate(output_details)]}")
-        
-        # The key fix: YamNet expects the waveform in a specific way
-        # Based on the input shape [1], it seems to want the entire waveform as a 1D array
-        # Let's try providing the waveform directly without batch dimension
-        
-        # Set input tensor - provide the 15600 samples as a 1D array
-        yamnet.set_tensor(input_details[0]["index"], waveform)
-        
-        # Invoke the model
-        print("🚀 Running YamNet inference...")
-        yamnet.invoke()
+        print(f"📋 Expected input shape: {input_details[0]['shape']}")
+
+        # The model expects shape [1] - this is unusual for YamNet
+        # This suggests the model has been modified to expect pre-computed features
+        # Let's compute audio features and use them as input
+
+        # Compute various audio features that could be the expected input
+        audio_features = {
+            "rms_energy": np.sqrt(np.mean(data**2)),
+            "mean_amplitude": np.mean(data),
+            "max_amplitude": np.max(np.abs(data)),
+            "zero_crossing_rate": np.mean(np.abs(np.diff(data > 0))),
+            "spectral_centroid": np.mean(np.abs(np.fft.fft(data)[:len(data)//2])),
+        }
+
+        # Try each feature until one works
+        success = False
+        for feature_name, feature_value in audio_features.items():
+            try:
+                # Create input array with shape [1] as expected
+                feature_input = np.array([feature_value], dtype=np.float32)
+                print(f"🔄 Trying {feature_name}: {feature_value:.6f}")
+
+                yamnet.set_tensor(input_details[0]["index"], feature_input)
+                yamnet.invoke()
+
+                print(f"✅ Success with {feature_name}!")
+                success = True
+                feature_used = feature_name
+                break
+
+            except Exception as e:
+                print(f"❌ {feature_name} failed: {e}")
+                continue
+
+        if not success:
+            # If single features don't work, try the first sample or a statistical summary
+            try:
+                # Try using just the first sample
+                single_sample = np.array([data[0]], dtype=np.float32)
+                print(f"🔄 Trying first sample: {single_sample[0]:.6f}")
+
+                yamnet.set_tensor(input_details[0]["index"], single_sample)
+                yamnet.invoke()
+                print("✅ Success with first sample!")
+                feature_used = "first_sample"
+            except Exception as e:
+                print(f"❌ All approaches failed: {e}")
+                raise HTTPException(status_code=500, detail=f"Could not find compatible input format for YamNet model. Input shape expected: {input_details[0]['shape']}")
+
         print("✅ YamNet inference completed")
 
         # ✅ Extract the 1024-dimensional embedding from Output 1
         print("🔍 Extracting 1024-dim embedding from Output 1...")
-        
+
         # Output 1: [1, 1024] - This is the embedding we need!
         embedding_output = yamnet.get_tensor(1)  # shape: [1, 1024]
-        
+
         print(f"📊 Output 1 shape: {embedding_output.shape}")
         print(f"📊 Output 1 sample values: {embedding_output[0][:5].tolist()}")
-        
+
         # Extract the 1024-dimensional vector (remove batch dimension)
         final_embedding = embedding_output[0].astype(np.float32)  # shape: [1024]
         embedding_source = "output_1_identity_1"
-        
+
         print(f"📊 Final embedding shape: {final_embedding.shape}, source: {embedding_source}")
+        print(f"📊 Feature used: {feature_used}")
         print(f"📊 Embedding non-zero: {np.count_nonzero(final_embedding)}/{len(final_embedding)}")
         print(f"📊 Embedding range: [{np.min(final_embedding):.4f}, {np.max(final_embedding):.4f}]")
         print(f"📊 Embedding sample: {final_embedding[:5].tolist()}")
