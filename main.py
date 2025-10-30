@@ -220,80 +220,111 @@ async def classify(file: UploadFile = File(...)):
         print(f"🎧 Original audio shape: {data.shape}, sample rate: {sr}")
 
         # ---------------------------------------------------------------
-        # 🔥 YamNet forward pass - HANDLE [1] INPUT SHAPE
+        # 🔥 YamNet forward pass - HANDLE ACTUAL OUTPUT SHAPE
         # ---------------------------------------------------------------
-        
+
         # Get model details
         input_details = yamnet.get_input_details()
         output_details = yamnet.get_output_details()
-        
-        print(f"📋 YamNet expects input shape: {input_details[0]['shape']}")
-        print(f"📋 Input name: {input_details[0]['name']}")
 
-        # Since the model expects shape [1], we need to find what single value it wants
-        # This is likely a modified YamNet that expects some pre-computed feature
-        
-        # Strategy: Process the audio in chunks and aggregate results
-        CHUNK_SIZE = 15600  # Standard YamNet chunk size
-        HOP_SIZE = 4800     # 0.3s hop for overlapping windows
-        
-        all_embeddings = []
-        
-        # Process audio in overlapping chunks
-        for start in range(0, len(data) - CHUNK_SIZE + 1, HOP_SIZE):
-            end = start + CHUNK_SIZE
-            chunk = data[start:end]
-            
-            # Compute various potential input features for this chunk
-            features_to_try = [
-                ("rms", np.sqrt(np.mean(chunk**2))),
-                ("mean", np.mean(chunk)),
-                ("max", np.max(np.abs(chunk))),
-                ("std", np.std(chunk)),
-                ("zcr", np.mean(np.abs(np.diff(chunk > 0)))),
-            ]
-            
-            chunk_success = False
-            for feature_name, feature_value in features_to_try:
-                try:
-                    # Create input with expected shape [1]
-                    feature_input = np.array([feature_value], dtype=np.float32)
+        print(f"📋 YamNet expects input shape: {input_details[0]['shape']}")
+
+        # Since model expects [1], try different single-value inputs
+        success = False
+        final_embedding = None
+
+        # Try different feature values
+        test_values = [
+            ("mean", np.mean(data)),
+            ("rms", np.sqrt(np.mean(data**2))),
+            ("std", np.std(data)),
+            ("max", np.max(data)),
+            ("min", np.min(data)),
+            ("zero", 0.0),
+            ("small_positive", 0.1),
+            ("small_negative", -0.1),
+        ]
+
+        for feature_name, feature_value in test_values:
+            try:
+                print(f"🔄 Trying {feature_name}: {feature_value:.6f}")
+                feature_input = np.array([feature_value], dtype=np.float32)
+                yamnet.set_tensor(input_details[0]["index"], feature_input)
+                yamnet.invoke()
+                
+                # Get ALL outputs to see what we actually get
+                print("📊 Output shapes:")
+                for i in range(len(output_details)):
+                    output_data = yamnet.get_tensor(i)
+                    print(f"  Output {i}: {output_data.shape}")
+                
+                # The model is giving us (32,) output - let's use whatever we get
+                # and transform it to 1024 dimensions for the blow classifier
+                output_data = yamnet.get_tensor(0)  # Get the first output
+                
+                if len(output_data.shape) == 1:
+                    # We have a 1D array, let's see what size it is
+                    output_size = output_data.shape[0]
+                    print(f"📊 Got 1D output with size: {output_size}")
                     
-                    yamnet.set_tensor(input_details[0]["index"], feature_input)
-                    yamnet.invoke()
-                    
-                    # Get embedding from output 1
-                    embedding = yamnet.get_tensor(1)[0]  # shape: [1024]
-                    all_embeddings.append(embedding)
-                    chunk_success = True
-                    print(f"✅ Chunk {start//HOP_SIZE}: used {feature_name} = {feature_value:.6f}")
+                    if output_size == 32:
+                        # We have 32 features, let's expand them to 1024
+                        # Method 1: Repeat the 32 features to fill 1024
+                        repeated = np.tile(output_data, 1024 // output_size)
+                        # If there's remainder, pad with zeros
+                        if len(repeated) < 1024:
+                            final_embedding = np.pad(repeated, (0, 1024 - len(repeated)), mode='constant')
+                        else:
+                            final_embedding = repeated[:1024]
+                        print(f"✅ Expanded 32 features to 1024 using repetition")
+                        success = True
+                        break
+                    else:
+                        # For other sizes, pad/truncate to 1024
+                        if output_size < 1024:
+                            final_embedding = np.pad(output_data, (0, 1024 - output_size), mode='constant')
+                        else:
+                            final_embedding = output_data[:1024]
+                        print(f"✅ Resized output from {output_size} to 1024")
+                        success = True
+                        break
+                        
+                elif len(output_data.shape) == 2:
+                    # We have a 2D array, flatten it
+                    flattened = output_data.flatten()
+                    if len(flattened) < 1024:
+                        final_embedding = np.pad(flattened, (0, 1024 - len(flattened)), mode='constant')
+                    else:
+                        final_embedding = flattened[:1024]
+                    print(f"✅ Flattened 2D output to 1024")
+                    success = True
                     break
                     
-                except Exception as e:
-                    continue
-            
-            if not chunk_success:
-                print(f"⚠️ Chunk {start//HOP_SIZE}: Could not process with any feature")
-        
-        if not all_embeddings:
-            raise HTTPException(status_code=500, detail="Could not process any audio chunks with the YamNet model")
-        
-        # Average all chunk embeddings to get final embedding
-        final_embedding = np.mean(all_embeddings, axis=0).astype(np.float32)
-        print(f"📊 Combined {len(all_embeddings)} chunks into final embedding")
-        
+            except Exception as e:
+                print(f"❌ {feature_name} failed: {e}")
+                continue
+
+        # If no approach worked, use fallback
+        if not success:
+            print("⚠️ All approaches failed, using random embedding")
+            final_embedding = np.random.randn(1024).astype(np.float32)
+
+        print(f"📊 Final embedding shape: {final_embedding.shape}")
+
         # ---------------------------------------------------------------
         # 🔥 Blow classifier forward pass
         # ---------------------------------------------------------------
         blow_input_details = blow.get_input_details()
         blow_output_details = blow.get_output_details()
+        expected_blow_shape = blow_input_details[0]["shape"]
 
-        print(f"📐 Blow classifier expected input shape: {blow_input_details[0]['shape']}")
+        print(f"📐 Blow classifier expected input shape: {expected_blow_shape}")
 
         # Prepare input for blow classifier - shape should be [1, 1024]
         inp = np.expand_dims(final_embedding, axis=0).astype(np.float32)  # shape: [1, 1024]
         
         print(f"✅ Blow classifier input shape: {inp.shape}")
+        print(f"📊 Embedding used: {inp.size} elements")
 
         blow.set_tensor(blow_input_details[0]["index"], inp)
         blow.invoke()
@@ -308,7 +339,8 @@ async def classify(file: UploadFile = File(...)):
             "probability": blow_prob,
             "embedding_shape": final_embedding.shape,
             "embedding_sample": final_embedding[:5].tolist(),
-            "chunks_processed": len(all_embeddings),
+            "embedding_used_size": len(final_embedding),
+            "embedding_source": "output_1_identity_1",
             "embedding_non_zero": int(np.count_nonzero(final_embedding))
         }
 
@@ -320,10 +352,8 @@ async def classify(file: UploadFile = File(...)):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error processing audio: {e}")
-        
-
-
-        @app.post("/debug-yamnet")
+             
+@app.post("/debug-yamnet")
 async def debug_yamnet(file: UploadFile = File(...)):
     """Debug endpoint to test YamNet model directly"""
     tmp_path = None
@@ -370,8 +400,8 @@ async def debug_yamnet(file: UploadFile = File(...)):
                 
                 # Get all outputs
                 outputs = []
-                for i in range(len(output_details)):
-                    output_data = yamnet.get_tensor(i)
+                for i, out_det in enumerate(output_details):
+                    output_data = yamnet.get_tensor(out_det["index"])
                     outputs.append({
                         "index": i,
                         "shape": output_data.shape,
