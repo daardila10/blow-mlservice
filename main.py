@@ -126,7 +126,9 @@ async def load_models():
     
     print("=== YAMNET MODEL DETAILS ===")
     print("Input details:", yamnet_input_details)
-    print("Output details:", yamnet_output_details)
+    print("Number of outputs:", len(yamnet_output_details))
+    for i, output_detail in enumerate(yamnet_output_details):
+        print(f"Output {i}: shape={output_detail['shape']}, dtype={output_detail['dtype']}, name={output_detail.get('name', 'unknown')}")
     
     # Blow classifier model details
     blow_input_details = blow.get_input_details()
@@ -213,10 +215,10 @@ async def classify(file: UploadFile = File(...)):
         print(f"🎧 Original audio shape: {data.shape}, sample rate: {sr}")
 
         # ---------------------------------------------------------------
-        # 🔥 YamNet forward pass (EXACTLY like Kotlin version)
+        # 🔥 YamNet forward pass
         # ---------------------------------------------------------------
         
-        # Resize YamNet input to exactly 15600 samples (like Kotlin does)
+        # Resize YamNet input to exactly 15600 samples
         EXPECTED_SAMPLES = 15600
         
         # Prepare waveform array (pad/truncate as needed)
@@ -226,7 +228,7 @@ async def classify(file: UploadFile = File(...)):
         
         print(f"📐 YamNet input shape after processing: {waveform.shape}")
         
-        # Resize the interpreter input tensor (like Kotlin's resizeInput)
+        # Resize the interpreter input tensor
         yamnet.resize_tensor_input(0, [EXPECTED_SAMPLES])
         yamnet.allocate_tensors()
         
@@ -235,6 +237,9 @@ async def classify(file: UploadFile = File(...)):
         output_details = yamnet.get_output_details()
         
         print(f"✅ Final YamNet input shape: {input_details[0]['shape']}")
+        print(f"📊 YamNet has {len(output_details)} outputs:")
+        for i, out in enumerate(output_details):
+            print(f"  Output {i}: shape={out['shape']}, dtype={out['dtype']}")
         
         # Set input tensor (1D array of 15600 samples)
         yamnet.set_tensor(input_details[0]["index"], waveform)
@@ -242,37 +247,50 @@ async def classify(file: UploadFile = File(...)):
         # Invoke the model
         yamnet.invoke()
 
-        # ✅ Extract embedding from Identity_1 output (like Kotlin)
-        # Based on your Kotlin code: 
-        # - Identity: scores (521 classes) 
-        # - Identity_1: embeddings (1024 dimensions) - THIS IS WHAT WE NEED
-        # - Identity_2: spectrogram
+        # ✅ Extract embedding - try different strategies to find the 1024-dim embedding
+        embedding = None
         
-        # Find the correct output index for embeddings
-        embedding_output_index = None
+        # Strategy 1: Look for output with shape that includes 1024
         for i, output_detail in enumerate(output_details):
-            if len(output_detail['shape']) == 1 and output_detail['shape'][0] == 1024:
-                embedding_output_index = i
-                break
+            shape = output_detail['shape']
+            if 1024 in shape:
+                output_data = yamnet.get_tensor(i)
+                print(f"🎯 Found potential embedding at output {i} with shape {shape}")
+                # Flatten and take first 1024 elements if needed
+                flat_output = output_data.flatten()
+                if len(flat_output) >= 1024:
+                    embedding = flat_output[:1024].astype(np.float32)
+                    print(f"✅ Using embedding from output {i}, shape: {embedding.shape}")
+                    break
         
-        if embedding_output_index is None:
-            # Fallback: try to find by name or use index 1 (like Kotlin's Identity_1)
-            try:
-                # Try to get output by expected characteristics
-                embedding_output_index = 1  # Based on Kotlin: Identity_1 is embeddings
-            except:
-                raise ValueError("Could not find embedding output in YamNet model")
-        
-        # Get the embedding (first frame, like Kotlin does)
-        embeddings_output = yamnet.get_tensor(embedding_output_index)
-        
-        # If output has multiple frames, take the first one (like Kotlin's embeddings[0])
-        if len(embeddings_output.shape) > 1:
-            embedding = embeddings_output[0].astype(np.float32)
-        else:
-            embedding = embeddings_output.astype(np.float32)
+        # Strategy 2: If no 1024-dim output found, try to find the largest output
+        if embedding is None:
+            print("🔍 No 1024-dim output found, looking for largest output...")
+            max_size = 0
+            best_output_idx = -1
+            for i, output_detail in enumerate(output_details):
+                output_data = yamnet.get_tensor(i)
+                flat_size = output_data.flatten().shape[0]
+                print(f"  Output {i}: flat size = {flat_size}")
+                if flat_size > max_size:
+                    max_size = flat_size
+                    best_output_idx = i
             
-        print(f"📊 YamNet embedding shape: {embedding.shape}")
+            if best_output_idx >= 0:
+                output_data = yamnet.get_tensor(best_output_idx)
+                embedding = output_data.flatten().astype(np.float32)
+                print(f"✅ Using largest output {best_output_idx} as embedding, shape: {embedding.shape}")
+        
+        # Strategy 3: If still no embedding, use the first output
+        if embedding is None and len(output_details) > 0:
+            output_data = yamnet.get_tensor(0)
+            embedding = output_data.flatten().astype(np.float32)
+            print(f"⚠️ Using first output as embedding, shape: {embedding.shape}")
+        
+        if embedding is None:
+            raise ValueError("Could not extract embedding from YamNet model")
+            
+        print(f"📊 Final embedding shape: {embedding.shape}")
 
         # ---------------------------------------------------------------
         # 🔥 Blow classifier forward pass
@@ -283,7 +301,9 @@ async def classify(file: UploadFile = File(...)):
 
         print(f"📐 Blow classifier expected input shape: {expected_blow_shape}")
 
-        # Prepare input for blow classifier (exactly like before)
+        # Prepare input for blow classifier
+        # If embedding is smaller than expected, pad with zeros
+        # If embedding is larger, truncate
         inp = np.zeros(tuple(expected_blow_shape), dtype=np.float32)
         flat = inp.ravel()
         src = embedding.flatten()
@@ -305,7 +325,8 @@ async def classify(file: UploadFile = File(...)):
             "prediction": "blow" if blow_prob > 0.5 else "no_blow", 
             "probability": blow_prob,
             "embedding_shape": embedding.shape,
-            "embedding_sample": embedding[:5].tolist()  # First 5 values for debugging
+            "embedding_sample": embedding[:5].tolist(),  # First 5 values for debugging
+            "embedding_used_size": n
         }
 
     except Exception as e:
