@@ -258,17 +258,36 @@ async def classify(file: UploadFile = File(...)):
                 'shape': output_data.shape,
                 'flat_size': flat_output.shape[0],
                 'data': output_data,
-                'sample_values': flat_output[:5].tolist() if flat_output.shape[0] > 0 else []
+                'sample_values': flat_output[:5].tolist() if flat_output.shape[0] > 0 else [],
+                'non_zero_count': np.count_nonzero(flat_output)
             })
-            print(f"  Output {i}: shape={output_data.shape}, flat_size={flat_output.shape[0]}, sample={all_outputs[-1]['sample_values']}")
+            print(f"  Output {i}: shape={output_data.shape}, flat_size={flat_output.shape[0]}, non_zero={all_outputs[-1]['non_zero_count']}, sample={all_outputs[-1]['sample_values']}")
 
-        # Strategy: Find the most likely embedding output
-        # Based on your Kotlin code, we want a 1024-dimensional embedding
+        # CRITICAL FIX: Skip output 0 if it's the input data
+        # Output 0 appears to be the input waveform (15600 zeros), so we need to skip it
+        valid_outputs = []
+        for output_info in all_outputs:
+            # Skip outputs that are exactly the input waveform (15600 zeros)
+            if (output_info['flat_size'] == 15600 and 
+                output_info['non_zero_count'] == 0 and 
+                np.array_equal(output_info['sample_values'], [0.0, 0.0, 0.0, 0.0, 0.0])):
+                print(f"🚫 Skipping output {output_info['index']} - appears to be input data")
+                continue
+            valid_outputs.append(output_info)
+        
+        if not valid_outputs:
+            raise ValueError("No valid outputs found after filtering input data")
+        
+        print(f"✅ Valid outputs after filtering: {len(valid_outputs)}")
+        for output_info in valid_outputs:
+            print(f"  Output {output_info['index']}: shape={output_info['shape']}, flat_size={output_info['flat_size']}")
+
+        # Strategy: Find the most likely embedding output from valid outputs
         embedding = None
         embedding_source = "unknown"
         
         # Look for output with exactly 1024 elements
-        for output_info in all_outputs:
+        for output_info in valid_outputs:
             if output_info['flat_size'] == 1024:
                 embedding = output_info['data'].flatten().astype(np.float32)
                 embedding_source = f"output_{output_info['index']}_exact_1024"
@@ -277,10 +296,10 @@ async def classify(file: UploadFile = File(...)):
         
         # If no exact match, look for output that contains 1024 in its shape
         if embedding is None:
-            for output_info in all_outputs:
+            for output_info in valid_outputs:
                 if 1024 in output_info['shape']:
                     output_data = output_info['data']
-                    # If it's multi-dimensional, take the first frame
+                    # If it's multi-dimensional, take the first frame (like Kotlin does)
                     if len(output_data.shape) > 1:
                         embedding = output_data[0].flatten().astype(np.float32)
                     else:
@@ -289,27 +308,18 @@ async def classify(file: UploadFile = File(...)):
                     print(f"✅ Found embedding with 1024 in shape at output {output_info['index']}")
                     break
         
-        # If still no embedding, use the output with the most non-zero values
+        # If still no embedding, use the valid output with the most non-zero values
         if embedding is None:
-            best_output = None
-            max_non_zero = -1
-            for output_info in all_outputs:
-                output_data = output_info['data']
-                flat_data = output_data.flatten()
-                non_zero_count = np.count_nonzero(flat_data)
-                if non_zero_count > max_non_zero:
-                    max_non_zero = non_zero_count
-                    best_output = output_info
-            
-            if best_output is not None:
-                embedding = best_output['data'].flatten().astype(np.float32)
-                embedding_source = f"output_{best_output['index']}_most_non_zero"
-                print(f"✅ Using output {best_output['index']} with most non-zero values ({max_non_zero}) as embedding")
+            best_output = max(valid_outputs, key=lambda x: x['non_zero_count'])
+            embedding = best_output['data'].flatten().astype(np.float32)
+            embedding_source = f"output_{best_output['index']}_most_non_zero"
+            print(f"✅ Using output {best_output['index']} with most non-zero values ({best_output['non_zero_count']}) as embedding")
         
         if embedding is None:
             raise ValueError("Could not extract embedding from YamNet model")
             
         print(f"📊 Final embedding shape: {embedding.shape}, source: {embedding_source}")
+        print(f"📊 Embedding sample values: {embedding[:5].tolist()}")
 
         # ---------------------------------------------------------------
         # 🔥 Blow classifier forward pass
