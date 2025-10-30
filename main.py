@@ -215,7 +215,7 @@ async def classify(file: UploadFile = File(...)):
         print(f"🎧 Original audio shape: {data.shape}, sample rate: {sr}")
 
         # ---------------------------------------------------------------
-        # 🔥 YamNet forward pass - USE CORRECT OUTPUT 1
+        # 🔥 YamNet forward pass - FIXED INPUT HANDLING
         # ---------------------------------------------------------------
         
         # IMPORTANT: YamNet expects exactly 15600 samples at 16kHz
@@ -226,27 +226,21 @@ async def classify(file: UploadFile = File(...)):
         actual_samples = min(data.shape[0], EXPECTED_SAMPLES)
         waveform[:actual_samples] = data[:actual_samples]
         
-        print(f"📐 YamNet input shape: {waveform.shape}")
+        print(f"📐 YamNet input samples: {waveform.shape}")
         print(f"📊 Input non-zero samples: {np.count_nonzero(waveform)}/{len(waveform)}")
         
-        # Reset and reallocate the interpreter with correct input shape
-        yamnet = tf.lite.Interpreter(model_path=YAMNET_PATH)
-        
-        # CRITICAL: The model expects shape [1] but we need to provide [15600] samples
-        # Let's resize to the actual expected input size
-        yamnet.resize_tensor_input(0, [EXPECTED_SAMPLES])
-        yamnet.allocate_tensors()
-        
-        # Get input details after resizing
+        # Get input details - the model expects shape [1] but we need to provide the actual samples
         input_details = yamnet.get_input_details()
         output_details = yamnet.get_output_details()
         
-        print(f"✅ Final YamNet input shape: {input_details[0]['shape']}")
-        print(f"📊 YamNet outputs:")
-        for i, out in enumerate(output_details):
-            print(f"  Output {i}: shape={out['shape']}, name={out.get('name', 'unknown')}")
+        print(f"📋 YamNet input details: {input_details[0]}")
+        print(f"📋 YamNet output details: {[{'index': i, 'shape': out['shape']} for i, out in enumerate(output_details)]}")
         
-        # Set input tensor - provide the 15600 samples
+        # The key fix: YamNet expects the waveform in a specific way
+        # Based on the input shape [1], it seems to want the entire waveform as a 1D array
+        # Let's try providing the waveform directly without batch dimension
+        
+        # Set input tensor - provide the 15600 samples as a 1D array
         yamnet.set_tensor(input_details[0]["index"], waveform)
         
         # Invoke the model
@@ -254,8 +248,8 @@ async def classify(file: UploadFile = File(...)):
         yamnet.invoke()
         print("✅ YamNet inference completed")
 
-        # ✅ Extract the 1024-dimensional embedding from Output 1 (Identity_1)
-        print("🔍 Extracting 1024-dim embedding from Output 1 (Identity_1)...")
+        # ✅ Extract the 1024-dimensional embedding from Output 1
+        print("🔍 Extracting 1024-dim embedding from Output 1...")
         
         # Output 1: [1, 1024] - This is the embedding we need!
         embedding_output = yamnet.get_tensor(1)  # shape: [1, 1024]
@@ -314,7 +308,7 @@ async def classify(file: UploadFile = File(...)):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error processing audio: {e}")
-
+        
 # ==============================================================
 # 🏠 ROOT & TEST ENDPOINTS
 # ==============================================================
