@@ -521,3 +521,8 @@ async def model_info():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting model info: {e}")
+
+@app.api_route("/health", methods=["GET", "HEAD", "OPTIONS"])
+async def health():
+    """Simple health endpoint for uptime monitors (supports GET/HEAD/OPTIONS)."""
+    return {"status": "ok"}
