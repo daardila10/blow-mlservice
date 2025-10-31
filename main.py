@@ -173,7 +173,9 @@ def convert_audio_format(audio_data: bytes) -> bytes:
 # ==============================================================
 # 🎤 CLASSIFY ENDPOINT
 # ==============================================================
-
+@app.get("/classify")
+async def classify_get():
+    return {"detail": "This endpoint accepts POST with multipart/form-data file. Use POST to /classify with form field 'file'."}
 @app.post("/classify")
 async def classify(file: UploadFile = File(...)):
     tmp_path = None
