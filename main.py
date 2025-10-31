@@ -529,6 +529,6 @@ async def health():
     """Simple health endpoint for uptime monitors (supports GET/HEAD/OPTIONS)."""
     return {"status": "ok"}
 
-    @app.api_route("/", methods=["GET", "HEAD"])
+@app.api_route("/", methods=["GET", "HEAD"])
 async def home():
     return {"message": "✅ FastAPI ML Service running with Google Drive models!"}
